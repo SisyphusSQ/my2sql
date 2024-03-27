@@ -2,12 +2,13 @@ package base
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
-	
-	"github.com/siddontang/go-log/log"
+
 	"github.com/go-mysql-org/go-mysql/mysql"
-        "github.com/go-mysql-org/go-mysql/replication"
+	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/siddontang/go-log/log"
 )
 
 func ParserAllBinEventsFromRepl(cfg *ConfCmd) {
@@ -29,7 +30,7 @@ func NewReplBinlogStreamer(cfg *ConfCmd) *replication.BinlogStreamer {
 		Charset:                 "utf8",
 		SemiSyncEnabled:         false,
 		TimestampStringLocation: GBinlogTimeLocation,
-		ParseTime:               false, //donot parse mysql datetime/time column into go time structure, take it as string
+		ParseTime:               false, //do not parse mysql datetime/time column into go time structure, take it as string
 		UseDecimal:              false, // sqlbuilder not support decimal type
 	}
 
@@ -45,8 +46,8 @@ func NewReplBinlogStreamer(cfg *ConfCmd) *replication.BinlogStreamer {
 
 func SendBinlogEventRepl(cfg *ConfCmd) {
 	var (
-		err 		error
-		ev 			*replication.BinlogEvent
+		err           error
+		ev            *replication.BinlogEvent
 		chkRe         int
 		currentBinlog string = cfg.StartFile
 		binEventIdx   uint64 = 0
@@ -66,38 +67,37 @@ func SendBinlogEventRepl(cfg *ConfCmd) {
 		//orgSqlEvent *replication.RowsQueryEvent
 	)
 	for {
-
 		if cfg.OutputToScreen {
 			ev, err = cfg.BinlogStreamer.GetEvent(context.Background())
 			if err != nil {
 				log.Fatalf(fmt.Sprintf("error to get binlog event"))
 				break
 			}
-		} else{
+		} else {
 			ctx, cancel := context.WithTimeout(context.Background(), EventTimeout)
 			ev, err = cfg.BinlogStreamer.GetEvent(ctx)
 			cancel()
-			if err == context.Canceled {
+			if errors.Is(err, context.Canceled) {
 				log.Infof("ready to quit! [%v]", err)
 				break
-			} else if err == context.DeadlineExceeded {
+			} else if errors.Is(err, context.DeadlineExceeded) {
 				log.Infof("deadline exceeded.")
 				break
-			} else if err !=nil {
-				log.Fatalf(fmt.Sprintf("error to get binlog event %v",err))
+			} else if err != nil {
+				log.Fatalf(fmt.Sprintf("error to get binlog event %v", err))
 				break
 			}
 		}
 
 		if ev.Header.EventType == replication.TABLE_MAP_EVENT {
-			tbMapPos = ev.Header.LogPos - ev.Header.EventSize 
+			tbMapPos = ev.Header.LogPos - ev.Header.EventSize
 			// avoid mysqlbing mask the row event as unknown table row event
 		}
 		ev.RawData = []byte{} // we donnot need raw data
 
 		oneMyEvent := &MyBinEvent{MyPos: mysql.Position{Name: currentBinlog, Pos: ev.Header.LogPos}, StartPos: tbMapPos}
 		chkRe = oneMyEvent.CheckBinEvent(cfg, ev, &currentBinlog)
-		
+
 		if chkRe == C_reContinue {
 			continue
 		} else if chkRe == C_reBreak {
@@ -111,11 +111,7 @@ func SendBinlogEventRepl(cfg *ConfCmd) {
 		//	log.Fatalf(fmt.Sprintf("Unsupported database name %s contains special character '#'", db))
 		//	break
 		//}
-		//if find := strings.Contains(tb, "#"); find {
-		//	log.Fatalf(fmt.Sprintf("Unsupported table name %s.%s contains special character '#'", db, tb))
-		//	break
-		//}
-	
+
 		if sqlType == "query" {
 			sqlLower = strings.ToLower(sql)
 			if sqlLower == "begin" {
@@ -125,11 +121,10 @@ func SendBinlogEventRepl(cfg *ConfCmd) {
 				trxStatus = C_trxCommit
 			} else if sqlLower == "rollback" {
 				trxStatus = C_trxRollback
-			} else if oneMyEvent.QuerySql != nil  {
+			} else if oneMyEvent.QuerySql != nil {
 				trxStatus = C_trxProcess
 				rowCnt = 1
 			}
-
 		} else {
 			trxStatus = C_trxProcess
 		}
@@ -139,12 +134,12 @@ func SendBinlogEventRepl(cfg *ConfCmd) {
 			if oneMyEvent.IfRowsEvent {
 
 				tbKey := GetAbsTableName(string(oneMyEvent.BinEvent.Table.Schema),
-						string(oneMyEvent.BinEvent.Table.Table))
+					string(oneMyEvent.BinEvent.Table.Table))
 				_, err = G_TablesColumnsInfo.GetTableInfoJson(string(oneMyEvent.BinEvent.Table.Schema),
-						string(oneMyEvent.BinEvent.Table.Table))
+					string(oneMyEvent.BinEvent.Table.Table))
 				if err != nil {
 					log.Fatalf(fmt.Sprintf("no table struct found for %s, it maybe dropped, skip it. RowsEvent position:%s",
-							tbKey, oneMyEvent.MyPos.String()))
+						tbKey, oneMyEvent.MyPos.String()))
 				}
 				ifSendEvent = true
 			}
@@ -157,9 +152,9 @@ func SendBinlogEventRepl(cfg *ConfCmd) {
 				oneMyEvent.TrxStatus = trxStatus
 				cfg.EventChan <- *oneMyEvent
 			}
-		} 
-		
-		//output analysis result whatever the WorkType is	
+		}
+
+		//output analysis result whatever the WorkType is
 		if sqlType != "" {
 			if sqlType == "query" {
 				cfg.StatChan <- BinEventStats{Timestamp: ev.Header.Timestamp, Binlog: currentBinlog, StartPos: ev.Header.LogPos - ev.Header.EventSize, StopPos: ev.Header.LogPos,
@@ -169,6 +164,5 @@ func SendBinlogEventRepl(cfg *ConfCmd) {
 					Database: db, Table: tb, QuerySql: sql, RowCnt: rowCnt, QueryType: sqlType}
 			}
 		}
-		
 	}
 }

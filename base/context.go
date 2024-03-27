@@ -9,11 +9,11 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/siddontang/go-log/log"
 	constvar "my2sql/constvar"
 	toolkits "my2sql/toolkits"
-	"github.com/siddontang/go-log/log"
-	"github.com/go-mysql-org/go-mysql/mysql"
-        "github.com/go-mysql-org/go-mysql/replication"
 )
 
 const (
@@ -81,16 +81,16 @@ type ConfCmd struct {
 	Passwd   string
 	ServerId uint
 
-	Databases    []string
-	Tables       []string
+	Databases []string
+	Tables    []string
 	//DatabaseRegs []*regexp.Regexp
 	//ifHasDbReg   bool
 	//TableRegs    []*regexp.Regexp
 	//ifHasTbReg   bool
 	IgnoreDatabases []string
-	IgnoreTables []string
-	FilterSql    []string
-	FilterSqlLen int
+	IgnoreTables    []string
+	FilterSql       []string
+	FilterSqlLen    int
 
 	StartFile         string
 	StartPos          uint
@@ -149,12 +149,13 @@ type ConfCmd struct {
 	IgnoreParsedErrForSql string // if parsed error, for sql match this regexp, only print error info, but not exits
 	IgnoreParsedErrRegexp *regexp.Regexp
 
-	EventChan  chan MyBinEvent
-	StatChan   chan BinEventStats
-	OrgSqlChan chan OrgSqlPrint
-	SqlChan    chan ForwardRollbackSqlOfPrint
+	EventChan   chan MyBinEvent
+	StatChan    chan BinEventStats
+	OrgSqlChan  chan OrgSqlPrint
+	SqlChan     chan ForwardRollbackSqlOfPrint
+	CanalEvChan chan CanalEventOfPrint
 
-	StatFH    *os.File
+	StatFH *os.File
 	//DdlFH     *os.File
 	BiglongFH *os.File
 
@@ -164,11 +165,11 @@ type ConfCmd struct {
 
 func (this *ConfCmd) ParseCmdOptions() {
 	var (
-		version          bool
-		dbs              string
-		tbs              string
-		ignoreDbs 		 string
-		ignoreTbs 		 string
+		version   bool
+		dbs       string
+		tbs       string
+		ignoreDbs string
+		ignoreTbs string
 
 		sqlTypes         string
 		startTime        string
@@ -187,15 +188,15 @@ func (this *ConfCmd) ParseCmdOptions() {
 	flag.StringVar(&this.MysqlType, "mysql-type", "mysql", StrSliceToString(GOptsValidMysqlType, C_joinSepComma, C_validOptMsg)+". server of binlog, mysql or mariadb, default mysql")
 
 	flag.StringVar(&this.Host, "host", "127.0.0.1", "mysql host, default 127.0.0.1 .")
-	flag.UintVar(&this.Port, "port",3306, "mysql port, default 3306.")
+	flag.UintVar(&this.Port, "port", 3306, "mysql port, default 3306.")
 	flag.StringVar(&this.User, "user", "", "mysql user. ")
 	flag.StringVar(&this.Passwd, "password", "", "mysql user password.")
 	flag.UintVar(&this.ServerId, "server-id", 1113306, "this program replicates from mysql as slave to read binlogs. Must set this server id unique from other slaves, default 1113306")
 
 	flag.StringVar(&dbs, "databases", "", "only parse these databases, comma seperated, default all.")
 	flag.StringVar(&tbs, "tables", "", "only parse these tables, comma seperated, DONOT prefix with schema, default all.")
-	flag.StringVar(&ignoreDbs, "ignore-databases", "","ignore parse these databases, comma seperated, default null")
-	flag.StringVar(&ignoreTbs, "ignore-tables", "","ignore parse these tables, comma seperated, default null")
+	flag.StringVar(&ignoreDbs, "ignore-databases", "", "ignore parse these databases, comma seperated, default null")
+	flag.StringVar(&ignoreTbs, "ignore-tables", "", "ignore parse these tables, comma seperated, default null")
 	flag.StringVar(&sqlTypes, "sql", "", StrSliceToString(GOptsValidFilterSql, C_joinSepComma, C_validOptMsg)+". only parse these types of sql, comma seperated, valid types are: insert, update, delete; default is all(insert,update,delete)")
 	flag.BoolVar(&this.IgnorePrimaryKeyForInsert, "ignore-primaryKey-forInsert", false, "for insert statement when -workType=2sql, ignore primary key")
 
@@ -257,7 +258,7 @@ func (this *ConfCmd) ParseCmdOptions() {
 
 	if tbs != "" {
 		this.Tables = CommaSeparatedListToArray(tbs)
-		
+
 	}
 
 	if ignoreDbs != "" {
@@ -267,7 +268,6 @@ func (this *ConfCmd) ParseCmdOptions() {
 	if ignoreTbs != "" {
 		this.IgnoreTables = CommaSeparatedListToArray(ignoreTbs)
 	}
-
 
 	if sqlTypes != "" {
 		this.FilterSql = CommaSeparatedListToArray(sqlTypes)
@@ -330,7 +330,6 @@ func (this *ConfCmd) ParseCmdOptions() {
 		this.IfSetStopParsPoint = false
 	}
 
-
 	if this.Mode == "file" {
 
 		if this.StartFile == "" {
@@ -345,28 +344,27 @@ func (this *ConfCmd) ParseCmdOptions() {
 	}
 
 	if this.Mode == "file" {
-	        if this.LocalBinFile == "" {
-	                log.Fatalf("missing binlog file.  -local-binlog-file must be specify when -mode=file ")
-	        }
-	        this.GivenBinlogFile = this.LocalBinFile
-	        if !toolkits.IsFile(this.GivenBinlogFile) {
-	                log.Fatalf("%s doesnot exists nor a file\n", this.GivenBinlogFile)
-	        } else {
-	                this.BinlogDir = filepath.Dir(this.GivenBinlogFile)
-	        }
+		if this.LocalBinFile == "" {
+			log.Fatalf("missing binlog file.  -local-binlog-file must be specify when -mode=file ")
+		}
+		this.GivenBinlogFile = this.LocalBinFile
+		if !toolkits.IsFile(this.GivenBinlogFile) {
+			log.Fatalf("%s doesnot exists nor a file\n", this.GivenBinlogFile)
+		} else {
+			this.BinlogDir = filepath.Dir(this.GivenBinlogFile)
+		}
 	}
 
-	
 	this.EventChan = make(chan MyBinEvent, this.Threads*2)
 	this.StatChan = make(chan BinEventStats, this.Threads*2)
 	this.SqlChan = make(chan ForwardRollbackSqlOfPrint, this.Threads*2)
 	this.StatChan = make(chan BinEventStats, this.Threads*2)
+	this.CanalEvChan = make(chan CanalEventOfPrint, this.Threads*2)
 	this.OpenStatsResultFiles()
 	this.OpenTxResultFiles()
 
-
 	this.CheckCmdOptions()
-	this.CreateDB()	
+	this.CreateDB()
 
 }
 
@@ -551,8 +549,7 @@ func (this *ConfCmd) OpenTxResultFiles() {
 	this.BiglongFH = biglongFH
 }
 
-
-func (this *ConfCmd) CloseFH(){
+func (this *ConfCmd) CloseFH() {
 	this.StatFH.Close()
 	this.BiglongFH.Close()
 }

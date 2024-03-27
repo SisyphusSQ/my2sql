@@ -1,5 +1,6 @@
 .gopath/
 main
+my2sql*
 .idea/
 *.deb
 *.pcap
@@ -7,3 +8,5 @@ main
 .vendor/go19
 /bin
 /build
+test/
+

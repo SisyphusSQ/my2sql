@@ -10,10 +10,9 @@ import (
 	"sync"
 	"time"
 
-	SQL "my2sql/sqlbuilder"
-	constvar "my2sql/constvar"
 	"github.com/siddontang/go-log/log"
-
+	"my2sql/constvar"
+	SQL "my2sql/sqlbuilder"
 )
 
 type ExtraSqlInfoOfPrint struct {
@@ -32,9 +31,15 @@ type ForwardRollbackSqlOfPrint struct {
 	sqlInfo ExtraSqlInfoOfPrint
 }
 
+type CanalEventOfPrint struct {
+	canalEvents []string
+	sqlInfo     ExtraSqlInfoOfPrint
+}
+
 var (
 	ForwardSqlFileNamePrefix  string = "forward"
 	RollbackSqlFileNamePrefix string = "rollback"
+	CanalEventFilePrefix      string = "canalEvent"
 )
 
 func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, wg *sync.WaitGroup) {
@@ -42,20 +47,23 @@ func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, wg *sync.WaitGroup)
 	var (
 		err error
 		//var currentIdx uint64
-		tbInfo             *TblInfoJson
-		db, tb, fulltb     string
-		allColNames        []FieldInfo
-		colsDef            []SQL.NonAliasColumn
-		colsTypeName       []string
-		colCnt             int
-		sqlArr             []string
-		uniqueKeyIdx       []int
-		uniqueKey          KeyInfo
-		primaryKeyIdx      []int
-		ifRollback         bool = false
-		ifIgnorePrimary    bool = cfg.IgnorePrimaryKeyForInsert
-		currentSqlForPrint ForwardRollbackSqlOfPrint
-		posStr             string
+		tbInfo                 *TblInfoJson
+		db, tb, fulltb         string
+		allColNames            []FieldInfo
+		colsDef                []SQL.NonAliasColumn
+		colsTypeName           []string
+		colCnt                 int
+		sqlArr                 []string
+		canalEvents            []string
+		uniqueKeyIdx           []int
+		uniqueKey              KeyInfo
+		primaryKeyIdx          []int
+		ifRollback             bool = false
+		ifIgnorePrimary        bool = cfg.IgnorePrimaryKeyForInsert
+		currentSqlForPrint     ForwardRollbackSqlOfPrint
+		currentCanalEvForPrint CanalEventOfPrint
+		posStr                 string
+		timestamp              uint32
 		//printStatementSql  bool = false
 	)
 	log.Infof(fmt.Sprintf("start thread %d to generate redo/rollback sql", i))
@@ -67,6 +75,7 @@ func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, wg *sync.WaitGroup)
 		if !ev.IfRowsEvent {
 			continue
 		}
+		timestamp = ev.Timestamp
 		posStr = GetPosStr(ev.MyPos.Name, ev.StartPos, ev.MyPos.Pos)
 		db = string(ev.BinEvent.Table.Schema)
 		tb = string(ev.BinEvent.Table.Table)
@@ -97,7 +106,7 @@ func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, wg *sync.WaitGroup)
 
 				}
 			}
-			
+
 			if colType == "blob" {
 				// text is stored as blob
 				if strings.Contains(strings.ToLower(tbInfo.Columns[ci].FieldType), "text") {
@@ -126,7 +135,6 @@ func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, wg *sync.WaitGroup)
 						ev.BinEvent.Rows[ri][ci] = string(txtStr)
 					}
 				}
-
 			}*/
 		}
 		uniqueKey = tbInfo.GetOneUniqueKey(cfg.UseUniqueKeyFirst)
@@ -162,16 +170,22 @@ func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, wg *sync.WaitGroup)
 				sqlArr = GenUpdateSqlsForOneRowsEvent(posStr, colsTypeNameFromMysql, colsTypeName, ev.BinEvent, colsDef, uniqueKeyIdx, cfg.FullColumns, false, cfg.SqlTblPrefixDb)
 			}
 		} else {
-			fmt.Println("unsupported query type %s to generate 2sql|rollback sql, it should one of insert|update|delete. %s", ev.SqlType, ev.MyPos.String())
+			fmt.Printf("unsupported query type %s to generate 2sql|rollback sql, it should one of insert|update|delete. %s\n", ev.SqlType, ev.MyPos.String())
 			continue
 		}
-		currentSqlForPrint = ForwardRollbackSqlOfPrint{sqls: sqlArr,
-			sqlInfo: ExtraSqlInfoOfPrint{schema: db, table: tb, binlog: ev.MyPos.Name, startpos: ev.StartPos, endpos: ev.MyPos.Pos,
-				datetime: GetDatetimeStr(int64(ev.Timestamp), int64(0), constvar.DATETIME_FORMAT_NOSPACE),
-				trxIndex: ev.TrxIndex, trxStatus: ev.TrxStatus}}
+		canalEvents = GenCanalEventForEvent(timestamp, tbInfo, ev.BinEvent, ev.SqlType, posStr)
+
+		sqlInfo := ExtraSqlInfoOfPrint{
+			schema: db, table: tb,
+			binlog: ev.MyPos.Name, startpos: ev.StartPos, endpos: ev.MyPos.Pos,
+			datetime:  GetDatetimeStr(int64(ev.Timestamp), int64(0), constvar.DATETIME_FORMAT_NOSPACE),
+			trxIndex:  ev.TrxIndex,
+			trxStatus: ev.TrxStatus,
+		}
+		currentSqlForPrint = ForwardRollbackSqlOfPrint{sqls: sqlArr, sqlInfo: sqlInfo}
+		currentCanalEvForPrint = CanalEventOfPrint{canalEvents: canalEvents, sqlInfo: sqlInfo}
 
 		for {
-			//fmt.Println("in thread", i)
 			G_HandlingBinEventIndex.lock.Lock()
 			//fmt.Println("handing index:", G_HandlingBinEventIndex.EventIdx, "binevent index:", ev.EventIdx)
 			if G_HandlingBinEventIndex.EventIdx == ev.EventIdx {
@@ -181,6 +195,7 @@ func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, wg *sync.WaitGroup)
 					}
 				} else {
 					cfg.SqlChan <- currentSqlForPrint
+					cfg.CanalEvChan <- currentCanalEvForPrint
 				}
 				G_HandlingBinEventIndex.EventIdx++
 				G_HandlingBinEventIndex.lock.Unlock()
@@ -190,7 +205,6 @@ func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, wg *sync.WaitGroup)
 
 			G_HandlingBinEventIndex.lock.Unlock()
 			time.Sleep(1 * time.Microsecond)
-
 		}
 	}
 	log.Infof(fmt.Sprintf("exit thread %d to generate redo/rollback sql", i))
@@ -299,7 +313,6 @@ func GetForwardRollbackSqlFileName(schema string, table string, filePerTable boo
 			} else {
 				return filepath.Join(outDir, fmt.Sprintf(".%s.%d.sql", RollbackSqlFileNamePrefix, idx))
 			}
-
 		} else {
 			if filePerTable {
 				return filepath.Join(outDir, fmt.Sprintf("%s.%s.%s.%d.sql", schema, table, RollbackSqlFileNamePrefix, idx))
@@ -313,9 +326,7 @@ func GetForwardRollbackSqlFileName(schema string, table string, filePerTable boo
 		} else {
 			return filepath.Join(outDir, fmt.Sprintf("%s.%d.sql", ForwardSqlFileNamePrefix, idx))
 		}
-
 	}
-
 }
 
 func GetForwardRollbackContentLineWithExtra(sq ForwardRollbackSqlOfPrint, ifExtra bool) string {
@@ -329,4 +340,84 @@ func GetForwardRollbackContentLineWithExtra(sq ForwardRollbackSqlOfPrint, ifExtr
 		return str
 	}
 
+}
+
+func PrintCanalEventForFullImageBinlog(cfg *ConfCmd, wg *sync.WaitGroup) {
+	defer wg.Done()
+	var (
+		err                error
+		FH                 *os.File
+		bufFH              *bufio.Writer
+		tmpFileName        string                   = ""
+		oneSqls            string                   = ""
+		fhArr              map[string]*os.File      = map[string]*os.File{}
+		fhArrBuf           map[string]*bufio.Writer = map[string]*bufio.Writer{}
+		lastPrintPos       uint32                   = 0
+		lastPrintFile      string                   = ""
+		printBytesInterval uint32                   = 1024 * 1024 * 10 //every 10MB print process info
+	)
+	log.Infof(fmt.Sprintf("start thread to write canalEvent for full image binlog event into file"))
+	for ce := range cfg.CanalEvChan {
+		tmpFileName = GetCanalEventFileName(ce.sqlInfo.schema, ce.sqlInfo.table, cfg.FilePerTable, cfg.OutputDir, false, ce.sqlInfo.binlog, false)
+
+		if _, ok := fhArr[tmpFileName]; !ok {
+			FH, err = os.OpenFile(tmpFileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+			if err != nil {
+
+			}
+			bufFH = bufio.NewWriter(FH)
+			fhArrBuf[tmpFileName] = bufFH
+			fhArr[tmpFileName] = FH
+		}
+
+		//lastTrxIndex = ce.sqlInfo.trxIndex
+		oneSqls = GetCanalEventContentLineWithExtra(ce, cfg.PrintExtraInfo)
+		fhArrBuf[tmpFileName].WriteString(oneSqls)
+		if lastPrintFile == "" {
+			lastPrintFile = ce.sqlInfo.binlog
+		}
+		if ce.sqlInfo.binlog != lastPrintFile {
+			lastPrintPos = 0
+			lastPrintFile = ce.sqlInfo.binlog
+			log.Infof(fmt.Sprintf("finish processing %s %d for canal event", ce.sqlInfo.binlog, ce.sqlInfo.endpos))
+		} else if ce.sqlInfo.endpos-lastPrintPos >= printBytesInterval {
+			lastPrintPos = ce.sqlInfo.endpos
+			log.Infof(fmt.Sprintf("finish processing %s %d for canal event", ce.sqlInfo.binlog, ce.sqlInfo.endpos))
+		}
+	}
+
+	for fn, bufFH := range fhArrBuf {
+		bufFH.Flush()
+		fhArr[fn].Close()
+	}
+	log.Info("finish writing canalEvent for full image binlog event into file")
+	log.Info("exit thread to write canalEvent for full image binlog event into file")
+}
+
+func GetCanalEventFileName(schema string, table string, filePerTable bool, outDir string, ifRollback bool, binlog string, ifTmp bool) string {
+	_, idx := GetBinlogBasenameAndIndex(binlog)
+	if ifTmp {
+		if filePerTable {
+			return filepath.Join(outDir, fmt.Sprintf(".%s.%s.%s.%d.txt", schema, table, CanalEventFilePrefix, idx))
+		} else {
+			return filepath.Join(outDir, fmt.Sprintf(".%s.%d.txt", CanalEventFilePrefix, idx))
+		}
+	} else {
+		if filePerTable {
+			return filepath.Join(outDir, fmt.Sprintf("%s.%s.%s.%d.txt", schema, table, CanalEventFilePrefix, idx))
+		} else {
+			return filepath.Join(outDir, fmt.Sprintf("%s.%d.txt", CanalEventFilePrefix, idx))
+		}
+	}
+}
+
+func GetCanalEventContentLineWithExtra(sq CanalEventOfPrint, ifExtra bool) string {
+	if ifExtra {
+		return fmt.Sprintf("# datetime=%s database=%s table=%s binlog=%s startpos=%d stoppos=%d\n%s;\n",
+			sq.sqlInfo.datetime, sq.sqlInfo.schema, sq.sqlInfo.table, sq.sqlInfo.binlog, sq.sqlInfo.startpos,
+			sq.sqlInfo.endpos, strings.Join(sq.canalEvents, "\n"))
+	} else {
+		str := strings.Join(sq.canalEvents, "\n") + "\n"
+		return str
+	}
 }
